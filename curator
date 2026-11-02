@@ -1,0 +1,233 @@
+#!/usr/bin/python3 -I
+"""curator — CLI for the Claude Code port of the Hermes skill curator (`hermes curator ...`)."""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import shutil
+import sys
+from pathlib import Path
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+
+import curator_run  # noqa: E402
+import usage  # noqa: E402
+from common import (ARCHIVE, BACKUPS, LOGS, PAUSED, SKILLS, commit_all, config, ensure_git, git,  # noqa: E402
+                    git_paths, load_json, load_state, now, parse_iso, repo_lock, skill_entries,
+                    state_update)
+
+
+def cmd_status(_a) -> int:
+    cfg, st = config(), load_state()
+    last = parse_iso(st.get("last_run_at"))
+    nxt = last + curator_run.timedelta(hours=cfg["interval_hours"]) if last else None
+    print(f"curator: {'PAUSED' if PAUSED.exists() or st.get('paused') else 'enabled' if cfg['enabled'] else 'disabled'}"
+          f"   consolidate={cfg['consolidate']}   review={'on' if cfg['review']['enabled'] else 'off'}")
+    print(f"last run: {st.get('last_run_at') or 'never'}   next due: {nxt.isoformat(timespec='minutes') if nxt else 'after first SessionStart'}"
+          f"   runs: {st.get('run_count', 0)}")
+    print(f"last summary: {st.get('last_run_summary') or '-'}")
+    if st.get("last_report_path"):
+        print(f"last report: {st['last_report_path']}/REPORT.md")
+    print(f"reviews today: {st.get('reviews_by_day', {}).get(now().strftime('%Y-%m-%d'), 0)}"
+          f" / {cfg['review']['daily_cap']}   model: {cfg['review']['model'] or 'main (' + curator_run.main_model() + ')'}")
+    data = usage.load()
+    managed = usage.managed_names()
+    by_state = {s: sum(1 for n in managed if data[n].get("state") == s) for s in ("active", "stale", "archived")}
+    print(f"\ncurator-managed skills (created_by=agent): {len(managed)}  {by_state}")
+    pinned = sorted(n for n, r in data.items() if r.get("pinned"))
+    print(f"pinned: {', '.join(pinned) or 'none'}")
+    lru = sorted(managed, key=lambda n: usage.latest_activity_at(data[n]) or parse_iso(data[n].get("created_at")) or now())[:5]
+    if lru:
+        print("least recently active: " + ", ".join(lru))
+    archived = sorted(p.name for p in ARCHIVE.iterdir()) if ARCHIVE.exists() else []
+    print(f"archived: {', '.join(archived) or 'none'}")
+    unmanaged = [e["name"] for e in skill_entries() if e["kind"] == "writable" and e["name"] not in managed]
+    print(f"unmanaged writable skills (use `curator adopt <name>`): {', '.join(unmanaged) or 'none'}")
+    top = sorted(data.items(), key=lambda kv: -(kv[1].get("use_count") or 0))[:8]
+    if top:
+        print("\nusage (top by use_count):")
+        for n, r in top:
+            print(f"  {n:<32} use={r.get('use_count', 0):<4} view={r.get('view_count', 0):<4} patch={r.get('patch_count', 0):<3}"
+                  f" by={r.get('created_by')}  last_used={r.get('last_used_at') or '-'}")
+    reviews = sorted((LOGS / "reviews").glob("*.json"))[-3:]
+    if reviews:
+        print("\nrecent reviews:")
+        for p in reviews:
+            r = load_json(p, {})
+            print(f"  {p.name}: {(r.get('summary') or r.get('skipped') or '')[:110]}")
+    return 0
+
+
+def cmd_run(a) -> int:
+    if a.scheduled:  # started by the SessionStart hook, which holds the run claim
+        try:
+            run_dir = curator_run.run(trigger="scheduled")
+        finally:
+            curator_run.release_claim()
+    else:
+        run_dir = curator_run.run(dry_run=a.dry_run, consolidate=True if a.consolidate else None)
+    if run_dir is None:
+        print("skipped: skills repo busy")
+        return 1
+    print((run_dir / "REPORT.md").read_text())
+    return 0
+
+
+def cmd_review(a) -> int:
+    import review
+    args = ["--transcript", os.path.abspath(a.transcript), "--scope", a.scope, "--start", str(a.start)]
+    if a.end is not None:
+        args += ["--end", str(a.end)]
+    return review.main(args + (["--dry-run"] if a.dry_run else []))
+
+
+def set_paused(paused: bool) -> None:
+    with state_update() as st:
+        st["paused"] = paused
+    if paused:
+        PAUSED.touch()
+    else:
+        PAUSED.unlink(missing_ok=True)
+
+
+def local_skill_or_die(name: str) -> None:
+    p = SKILLS / name
+    if p.is_symlink():
+        sys.exit(f"{name} is an external skill (symlink into ~/.agents/skills); read-only to the curator")
+    if not (p / "SKILL.md").exists() or name in ("synced", "web-design"):
+        sys.exit(f"{name}: not a local writable skill in {SKILLS}")
+
+
+def cmd_pin(a) -> int:
+    local_skill_or_die(a.skill)
+    with usage.update() as d:
+        usage.record(d, a.skill)["pinned"] = a.cmd == "pin"
+    print(f"{a.cmd}ned {a.skill}")
+    return 0
+
+
+def cmd_adopt(a) -> int:
+    local_skill_or_die(a.skill)
+    with usage.update() as d:
+        rec = usage.record(d, a.skill)
+        if rec["created_by"] == "agent":
+            print(f"{a.skill} is already curator-managed")
+            return 0
+        rec["created_by"] = "agent"  # inactivity clock is NOT reset (Hermes adopt_skill)
+    print(f"adopted {a.skill} into curator management")
+    return 0
+
+
+def cmd_restore(a) -> int:
+    with repo_lock():
+        ok, msg = usage.restore_skill(a.skill)
+        print(msg)
+        if ok:
+            ensure_git()
+            commit_all(f"curator(restore): {a.skill}")
+    return 0 if ok else 1
+
+
+def last_unreverted_curator_commit() -> tuple[str, str] | None:
+    reverted = set(re.findall(r"This reverts commit ([0-9a-f]{40})", git("log", "--format=%B", "--grep=This reverts commit", check=False)))
+    for line in git("log", "--format=%H %s", "--grep=^curator(review)\\|^curator(run)", check=False).splitlines():
+        sha, subject = line.split(" ", 1)
+        if sha not in reverted:
+            return sha, subject
+    return None
+
+
+def cmd_rollback(a) -> int:
+    with repo_lock():
+        ensure_git()
+        return _rollback(a)
+
+
+def _rollback(a) -> int:
+    if a.list:
+        for snap in sorted(p for p in BACKUPS.iterdir() if p.is_dir()):
+            m = load_json(snap / "manifest.json", {})
+            print(f"{snap.name}  {m.get('reason')}  skills={len(m.get('skills', []))}")
+        print(git("log", "--format=%h %ad %s", "--date=short", "-n", "10", "--grep=^curator(", check=False))
+        return 0
+    if a.snapshot is not None:
+        snaps = sorted(p for p in BACKUPS.iterdir() if p.is_dir()) if BACKUPS.exists() else []
+        snap = BACKUPS / a.snapshot if a.snapshot else (snaps[-1] if snaps else None)
+        if not snap or not snap.exists():
+            sys.exit("no snapshot found")
+        names = curator_run.restore_snapshot(snap)
+        commit_all(f"curator(rollback): restore snapshot {snap.name}")
+        print(f"restored {len(names)} skill dirs, usage.json and the archive from {snap.name}")
+        return 0
+    found = last_unreverted_curator_commit()
+    if not found:
+        sys.exit("no curator commit to roll back")
+    sha, subject = found
+    deleted = {p.split("/", 1)[0] for p in git_paths("diff", "--name-only", "--diff-filter=D", f"{sha}^", sha)}
+    try:
+        git("revert", "--no-edit", sha)
+    except RuntimeError as e:
+        git("revert", "--abort", check=False)
+        sys.exit(f"cannot roll back {sha[:10]} {subject}: later edits touch the same lines.\n{e}\n"
+                 f"Nothing was changed. Resolve by hand: git -C {SKILLS} revert {sha[:10]}")
+    data = usage.load()
+    for name in sorted(deleted):  # archived by that commit, now back from git: move the archive copy home
+        copy = Path(data.get(name, {}).get("archived_path") or ARCHIVE / name)
+        if (SKILLS / name).is_dir() and copy.is_dir():
+            # git only restores tracked files; the archive copy also holds ignored ones (.env, build/, ...)
+            shutil.copytree(copy, SKILLS / name, symlinks=True, dirs_exist_ok=True)
+            shutil.rmtree(copy)
+            with usage.update() as d:
+                usage.record(d, name).update(state="active", archived_at=None, archived_path=None)
+    print(f"reverted {sha[:10]} {subject}")
+    return 0
+
+
+def cmd_log(a) -> int:
+    reports = sorted([*LOGS.glob("reviews/*.json"), *LOGS.glob("curator/*/run.json")], key=lambda p: p.stat().st_mtime)[-a.n:]
+    for p in reports:
+        r = load_json(p, {})
+        extra = f" ALERTS={len(r['alerts'])}" if r.get("alerts") else ""
+        print(f"{p}\n    {(r.get('summary') or r.get('skipped') or '')[:200]}{extra}")
+    alerts = LOGS / "alerts.log"
+    if alerts.exists():
+        print("\nalerts.log (tail):\n" + "".join(alerts.read_text().splitlines(True)[-10:]))
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="curator", description=__doc__)
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("status").set_defaults(fn=cmd_status)
+    p = sub.add_parser("run", help="run a curator pass now (prune-only unless --consolidate)")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--consolidate", action="store_true")
+    p.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
+    p.set_defaults(fn=cmd_run)
+    p = sub.add_parser("review", help="background-review a transcript now")
+    p.add_argument("transcript")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--scope", default="combined", choices=["combined", "skills", "memory"])
+    p.add_argument("--start", type=int, default=0)
+    p.add_argument("--end", type=int)
+    p.set_defaults(fn=cmd_review)
+    sub.add_parser("pause").set_defaults(fn=lambda a: (set_paused(True), print("paused"))[-1] or 0)
+    sub.add_parser("resume").set_defaults(fn=lambda a: (set_paused(False), print("resumed"))[-1] or 0)
+    for name, fn in (("pin", cmd_pin), ("unpin", cmd_pin), ("adopt", cmd_adopt), ("restore", cmd_restore)):
+        p = sub.add_parser(name)
+        p.add_argument("skill")
+        p.set_defaults(fn=fn)
+    p = sub.add_parser("rollback", help="revert the last curator commit, or restore a tar snapshot")
+    p.add_argument("--snapshot", nargs="?", const="", default=None, metavar="ID")
+    p.add_argument("--list", action="store_true")
+    p.set_defaults(fn=cmd_rollback)
+    p = sub.add_parser("log")
+    p.add_argument("-n", type=int, default=10)
+    p.set_defaults(fn=cmd_log)
+    a = ap.parse_args()
+    return a.fn(a)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

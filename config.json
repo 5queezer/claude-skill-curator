@@ -1,0 +1,21 @@
+{
+  "archive_after_days": 30,
+  "backup_keep": 2,
+  "consolidate": false,
+  "enabled": true,
+  "interval_hours": 168,
+  "min_idle_hours": 2,
+  "review": {
+    "creation_nudge_interval": 10,
+    "daily_cap": 12,
+    "digest_max_chars": 60000,
+    "enabled": true,
+    "max_budget_usd": 1.0,
+    "memory": true,
+    "memory_nudge_interval": 10,
+    "model": null,
+    "session_end_min_iterations": 3,
+    "timeout_seconds": 900
+  },
+  "stale_after_days": 14
+}

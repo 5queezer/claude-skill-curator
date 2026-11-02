@@ -1,0 +1,12 @@
+# runtime state — never commit
+__pycache__/
+.ruff_cache/
+archive/
+backups/
+locks/
+logs/
+run/
+sessions/
+state.json
+usage.json
+mcp-hindsight.json

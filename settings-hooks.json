@@ -1,0 +1,65 @@
+{
+  "Stop": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 -I /home/christian/.claude/curator/hook.py stop",
+          "timeout": 10,
+          "async": true
+        }
+      ]
+    }
+  ],
+  "SessionEnd": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 -I /home/christian/.claude/curator/hook.py session-end",
+          "timeout": 5
+        }
+      ]
+    }
+  ],
+  "PostToolUse": [
+    {
+      "matcher": "Skill",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 -I /home/christian/.claude/curator/hook.py skill-used",
+          "timeout": 10,
+          "async": true
+        }
+      ]
+    }
+  ],
+  "UserPromptExpansion": [
+    {
+      "matcher": "",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 -I /home/christian/.claude/curator/hook.py prompt-expansion",
+          "timeout": 10,
+          "async": true
+        }
+      ]
+    }
+  ],
+  "SessionStart": [
+    {
+      "matcher": "startup",
+      "hooks": [
+        {
+          "type": "command",
+          "command": "python3 -I /home/christian/.claude/curator/hook.py session-start",
+          "timeout": 10
+        }
+      ]
+    }
+  ]
+}
