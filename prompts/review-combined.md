@@ -1,10 +1,10 @@
 Review the conversation digest above and update two things:
 
-**Memory**: TWO distinct kinds of fact — pick the right one for each fact and pass it as the retain `tags`:
-  • tag `user` (Hermes USER.md): who the user is — persona, preferences, communication and work style, personal details they revealed, and expectations about how you should behave.
-  • tag `environment` (Hermes MEMORY.md): facts about the ENVIRONMENT you operate in — tool quirks, project conventions, config gotchas, paths and endpoints that matter.
+**Memory**: TWO distinct stores — pick the right one for each fact:
+  • {{USER_STORE}}: who the user is — persona, preferences, communication and work style, personal details they revealed, and expectations about how you should behave.
+  • {{ENV_STORE}}: facts about the ENVIRONMENT you operate in — tool quirks, project conventions, config gotchas, paths and endpoints that matter.
 
-One fact goes to ONE kind, never both — writing it twice bloats memory and crowds out the facts that matter; misrouting it puts it where the next session won't look. Before each retain, run mcp__hindsight__recall with a short query for that fact; if it is already stored, skip it. One concept per retain call, `context` = "curator background review". Never store secrets, credentials or tokens.
+One fact goes to ONE store, never both — writing it to both bloats both stores until they hit their size limits and crowds out the facts that matter; misrouting it puts it where the next session won't look. {{MEMORY_RULES}} Never store secrets, credentials or tokens.
 
 **Skills**: how to do this class of task. Be ACTIVE — most sessions produce at least one skill update. A pass that does nothing is a missed learning opportunity, not a neutral outcome.
 

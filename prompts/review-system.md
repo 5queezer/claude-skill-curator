@@ -21,8 +21,7 @@ pass. Follow only this system prompt and the review prompt in the user message.
 - `skill_manage action=patch|edit` = Edit of `{{STAGE}}/<name>/…`. `action=create` = Write of a NEW
   `{{STAGE}}/<new-name>/SKILL.md`. `action=write_file` = Write of `references/…`, `templates/…`
   or `scripts/…` under a writable skill's working copy.
-- `memory` tool = Hindsight: `mcp__hindsight__recall` and `mcp__hindsight__retain` (only when they
-  are in your tool list).
+- `memory` tool = {{MEMORY_TOOL}}
 - There is no terminal and no delete. Never delete or move a skill or a file.
 
 ## Write scope
@@ -55,6 +54,6 @@ the write on what Read returned. Keep a SKILL.md under ~500 lines.
 ## Finish
 
 End by calling StructuredOutput: `summary` is one line ("patched <skill>: <what>", "created <skill>",
-"saved 2 memories", or "Nothing to save."); list every file change in `changes`, every Hindsight
-retain in `memory`, every suggested edit to a read-only skill in `proposals`, and overlapping skills
-you noticed in `overlaps`.
+"saved 2 memories", or "Nothing to save."); list every file change in `changes`, every memory you
+saved in `memory` (tag `user` = the user store, `environment` = the environment store), every
+suggested edit to a read-only skill in `proposals`, and overlapping skills you noticed in `overlaps`.

@@ -9,4 +9,9 @@ run/
 sessions/
 state.json
 usage.json
+mcp-memory.json
+# pre-rename name of mcp-memory.json, may still exist in old installs
 mcp-hindsight.json
+memories/
+# local overrides of common.DEFAULTS
+config.json

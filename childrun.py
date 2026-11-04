@@ -11,8 +11,9 @@ import subprocess
 import tarfile
 from pathlib import Path
 
-from common import (AGENTS_SKILLS, CLAUDE_BIN, HOME, PLUGINS, ROOT, RUN_DIR, SKILLS, STAGE_ROOT, git,
-                    hindsight_server, save_json, skill_entries)
+from common import (AGENTS_SKILLS, CLAUDE_BIN, ENTRY_DELIMITER, HOME, LOCKS, MEMORIES, MEMORY_FILES, PLUGINS, ROOT,
+                    RUN_DIR, SKILLS, STAGE_ROOT, config, git, locked, memory_mcp_server, memory_mcp_tool, read_entries,
+                    save_json, skill_entries)
 
 PROTECTED_TREES = [AGENTS_SKILLS, SKILLS / "synced", SKILLS / "web-design"]
 WRITE_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
@@ -25,9 +26,10 @@ def tilde(p: Path) -> str:
 def permission_args(stage: Path, editable: list[str], *, dry_run: bool, memory: bool) -> list[str]:
     """--tools/--allowedTools/--disallowedTools for the child.
 
-    The child edits only the working copy *stage*/skills (copies of *editable* plus new skill dirs);
-    the live library is read-only to it. Claude Code matches only Edit(path) rules for file writes
-    (Write(path) rules are ignored), and an Edit rule covers Write too."""
+    The child edits only the working copy *stage*/skills (copies of *editable* plus new skill dirs)
+    and, with the builtin memory backend, *stage*/memories; the live library is read-only to it.
+    Claude Code matches only Edit(path) rules for file writes (Write(path) rules are ignored), and an
+    Edit rule covers Write too."""
     tools = ["Read", "Glob", "Grep"] + ([] if dry_run else ["Edit", "Write"])
     work = f"{tilde(stage)}/skills"
     allow = [f"Read({tilde(SKILLS)}/**)", f"Read({tilde(AGENTS_SKILLS)}/**)", f"Read({tilde(PLUGINS)}/**)",
@@ -38,21 +40,25 @@ def permission_args(stage: Path, editable: list[str], *, dry_run: bool, memory: 
         # Names that exist in the live library but are not editable must not be recreated in the stage.
         for name in sorted({e["name"] for e in skill_entries()} - set(editable)):
             deny += [f"Edit({work}/{name})", f"Edit({work}/{name}/**)"]
-    if memory:
-        allow.append("mcp__hindsight__recall")
-        (deny if dry_run else allow).append("mcp__hindsight__retain")
+    cfg = config()["review"]
+    if memory and cfg["memory_backend"] != "builtin":
+        allow.append(memory_mcp_tool(cfg, "recall"))
+        (deny if dry_run else allow).append(memory_mcp_tool(cfg, "retain"))
+    elif memory and not dry_run:
+        allow.append(f"Edit({tilde(stage)}/memories/**)")
     return ["--tools", ",".join(tools), "--allowedTools", *allow, "--disallowedTools", *deny]
 
 
 def write_mcp_config() -> Path | None:
-    """Minimal MCP config holding only the hindsight server (0600; it carries a bearer token)."""
-    server = hindsight_server()
+    """Minimal MCP config holding only the memory MCP server (0600; it may carry a bearer token)."""
+    cfg = config()["review"]
+    server = memory_mcp_server(cfg)
     if not server:
         return None
-    path = ROOT / "mcp-hindsight.json"
+    path = ROOT / "mcp-memory.json"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as fh:
-        json.dump({"mcpServers": {"hindsight": server}}, fh)
+        json.dump({"mcpServers": {cfg["memory_mcp"]["server"]: server}}, fh)
     return path
 
 
@@ -183,6 +189,45 @@ def apply_stage(stage: Path, before: dict[str, str], editable: set[str], existin
     return applied, alerts
 
 
+def stage_memories(stage: Path) -> dict[str, list[str]]:
+    """Copy MEMORY.md/USER.md into *stage*/memories (empty when missing); returns their entries per target."""
+    (stage / "memories").mkdir(parents=True, exist_ok=True)
+    before = {}
+    for target, name in MEMORY_FILES.items():
+        before[target] = read_entries(MEMORIES / name)
+        (stage / "memories" / name).write_text(ENTRY_DELIMITER.join(before[target]), encoding="utf-8")
+    return before
+
+
+def apply_memories(stage: Path, before: dict[str, list[str]], cfg: dict) -> tuple[dict[str, int], list[str]]:
+    """Append the reviewer's new memory entries to the live files; returns ({file: added}, alerts).
+
+    Background reviews may only add (Hermes _background_delete_gate): a file whose old entries are not
+    kept unchanged as a prefix, or that would exceed its char limit, is rejected whole. New entries are
+    appended to the live file as it is now, so entries written meanwhile are kept."""
+    added, alerts = {}, []
+    with locked(LOCKS / "memories.lock"):
+        for target, name in MEMORY_FILES.items():
+            old, after = before[target], read_entries(stage / "memories" / name)
+            if after == old:
+                continue
+            if after[:len(old)] != old:
+                alerts.append(f"ALERT memory change rejected: {name}: existing entries were edited, reordered or removed")
+                continue
+            live = read_entries(MEMORIES / name)
+            final = live + [e for e in dict.fromkeys(after[len(old):]) if e not in live]
+            size, limit = len(ENTRY_DELIMITER.join(final)), int(cfg[f"{target}_char_limit"])
+            if size > limit:
+                alerts.append(f"ALERT memory change rejected: {name}: {size:,} chars exceeds the {limit:,} limit")
+                continue
+            MEMORIES.mkdir(parents=True, exist_ok=True)
+            tmp = MEMORIES / f".{name}.{os.getpid()}.tmp"
+            tmp.write_text(ENTRY_DELIMITER.join(final), encoding="utf-8")
+            os.replace(tmp, MEMORIES / name)
+            added[name] = len(final) - len(live)
+    return added, alerts
+
+
 # --- guards ---
 
 def snapshot_protected(dest: Path) -> Path:
@@ -199,7 +244,7 @@ def enforce_calls(meta: dict, snapshot: Path | None, stage: Path) -> list[str]:
 
     Acts only on paths the child's own Edit/Write calls named, never on other changes."""
     alerts = []
-    work = Path(os.path.realpath(stage / "skills"))
+    work = Path(os.path.realpath(stage))
     tar = tarfile.open(snapshot) if snapshot and snapshot.exists() else None
     for call in meta.get("_raw_calls", []):
         fp = call["input"].get("file_path") if call["name"] in WRITE_TOOLS else None

@@ -13,10 +13,12 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
-from common import (LOCKS, LOGS, NOTICES, ROOT, RUN_DIR, SESSIONS, config, hindsight_server,  # noqa: E402
-                    is_paused, iso, load_json, locked, log, log_exc, now, save_json, state_update)
+from common import (ENTRY_DELIMITER, LOCKS, LOGS, MEMORIES, MEMORY_FILES, NOTICES, ROOT, RUN_DIR,  # noqa: E402
+                    SESSIONS, config, is_paused, iso, load_json, locked, log, log_exc, memory_mcp_server,
+                    memory_mcp_tool, now, read_entries, save_json, state_update)
 
 FIRST_SIGHT_MAX_BYTES = 8 * 1024 * 1024  # don't replay an enormous backlog on first sight
+MEMORY_TITLES = {"memory": "MEMORY (your personal notes)", "user": "USER PROFILE (who the user is)"}
 
 
 def log_payload_once(event: str, payload: dict) -> None:
@@ -74,13 +76,16 @@ def spawn_review(st: dict, payload: dict, scope: str, start: int, final: bool) -
 
 
 def advance(payload: dict, final: bool) -> None:
-    from transcript import EDIT_TOOLS, MEMORY_WRITE_TOOLS, scan
+    from transcript import EDIT_TOOLS, scan
     import usage
 
     sid, path = payload.get("session_id"), payload.get("transcript_path")
     if not sid or not path or not os.path.exists(path):
         return
     cfg = config()["review"]
+    builtin = cfg["memory_backend"] == "builtin"
+    # Foreground memory writes reset the memory nudge; the builtin store has no foreground tool.
+    memory_write_tools = set() if builtin else {memory_mcp_tool(cfg, "retain")}
     with locked(LOCKS / "sessions.lock"):
         sf = SESSIONS / f"{sid}.json"
         st = load_json(sf, {})
@@ -106,7 +111,7 @@ def advance(payload: dict, final: bool) -> None:
                     st["iters"], st["skills_from"] = 0, e["off"]
                 elif e.get("skill") and e["name"] == "Read" and e.get("skill_file", "").endswith("SKILL.md"):
                     views.append(e["skill"])
-                elif e["name"] in MEMORY_WRITE_TOOLS:
+                elif e["name"] in memory_write_tools:
                     st["turns"], st["memory_from"] = 0, e["off"]
         if views or patches:
             with usage.update() as data:
@@ -118,7 +123,7 @@ def advance(payload: dict, final: bool) -> None:
             need_iters = cfg["session_end_min_iterations"] if final else cfg["creation_nudge_interval"]
             need_turns = cfg["session_end_min_iterations"] if final else cfg["memory_nudge_interval"]
             skills = 0 < need_iters <= st["iters"]
-            memory = cfg["memory"] and 0 < need_turns <= st["turns"] and hindsight_server() is not None
+            memory = cfg["memory"] and 0 < need_turns <= st["turns"] and (builtin or memory_mcp_server(cfg) is not None)
             # Each scope reviews from its own cursor, so a memory-only review doesn't eat the tool
             # work a later skill review needs (and vice versa).
             skills = skills and st["cursor"] > st["skills_from"]
@@ -167,10 +172,27 @@ def on_session_start(payload: dict) -> None:
         if (idle >= float(cfg["min_idle_hours"]) or overdue) and curator_run.claim_run():
             detach([str(ROOT / "curator"), "run", "--scheduled"])
             log("hooks", f"curator run started (idle {idle:.1f}h, overdue={overdue})")
-    print_notice()
+    context = "\n\n".join(p for p in (memory_snapshot(cfg["review"]), notice_text()) if p)
+    if context:
+        print(json.dumps({"hookSpecificOutput": {"hookEventName": "SessionStart", "additionalContext": context}}))
 
 
-def print_notice() -> None:
+def memory_snapshot(cfg: dict) -> str:
+    """Frozen MEMORY.md/USER.md blocks for the builtin backend, as Hermes MemoryStore._render_block."""
+    if cfg["memory_backend"] != "builtin":
+        return ""
+    blocks, sep = [], "═" * 46
+    for target, name in MEMORY_FILES.items():
+        entries = list(dict.fromkeys(read_entries(MEMORIES / name)))  # Hermes dedupes on load
+        if not entries:
+            continue
+        content, limit = ENTRY_DELIMITER.join(entries), int(cfg[f"{target}_char_limit"])
+        pct = min(100, int(len(content) / limit * 100)) if limit > 0 else 0
+        blocks.append(f"{sep}\n{MEMORY_TITLES[target]} [{pct}% — {len(content):,}/{limit:,} chars]\n{sep}\n{content}")
+    return "\n\n".join(blocks)
+
+
+def notice_text() -> str:
     lines = []
     with state_update() as state:
         shown, last = state.get("last_run_summary_shown_at"), state.get("last_run_at")
@@ -187,8 +209,8 @@ def print_notice() -> None:
             NOTICES.unlink()
     if lines:
         out = lines if len(lines) <= 4 else lines[:3] + [f"... and {len(lines) - 3} more (`curator log`)"]
-        print("[skill curator, since your last session; mention it to the user only if relevant]")
-        print("\n".join(out))
+        return "\n".join(["[skill curator, since your last session; mention it to the user only if relevant]", *out])
+    return ""
 
 
 HANDLERS = {"stop": lambda p: advance(p, final=False), "session-end": lambda p: advance(p, final=True),

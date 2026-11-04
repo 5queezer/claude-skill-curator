@@ -5,7 +5,7 @@ DRY-RUN — REPORT ONLY. DO NOT MUTATE THE SKILL LIBRARY OR MEMORY.
 This is a PREVIEW pass. Follow every instruction below EXCEPT:
 
   • DO NOT Edit or Write any file (those tools are not available in this pass).
-  • DO NOT call mcp__hindsight__retain. mcp__hindsight__recall is fine.
+  • {{MEMORY_DRY_RUN}}
   • Glob, Grep and Read are FINE — read as much as you need.
 
 Your output IS the deliverable. Produce the exact same StructuredOutput you would produce on a live

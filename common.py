@@ -29,6 +29,10 @@ STATE_FILE = ROOT / "state.json"
 USAGE_FILE = ROOT / "usage.json"
 CONFIG_FILE = ROOT / "config.json"
 NOTICES = ROOT / "notices.jsonl"
+# Builtin memory backend (Hermes ~/.hermes/memories): MEMORY.md = environment, USER.md = user profile.
+MEMORIES = ROOT / "memories"
+MEMORY_FILES = {"memory": "MEMORY.md", "user": "USER.md"}
+ENTRY_DELIMITER = "\n§\n"
 CLAUDE_BIN = HOME / ".local" / "bin" / "claude"
 # Per-run working copies the child edits. Must be outside any `.claude` path: Claude Code treats those
 # as sensitive and refuses Edit/Write there in dontAsk mode even with an explicit allow rule.
@@ -58,6 +62,10 @@ DEFAULTS = {
         "max_budget_usd": 1.0,
         "timeout_seconds": 900,
         "digest_max_chars": 60000,
+        "memory_backend": "builtin",  # "builtin" (MEMORY.md/USER.md, like Hermes) or "mcp"
+        "memory_mcp": {"server": "hindsight", "recall_tool": "recall", "retain_tool": "retain"},
+        "memory_char_limit": 2200,  # Hermes memory_char_limit / user_char_limit
+        "user_char_limit": 1375,
     },
 }
 
@@ -114,6 +122,7 @@ def config() -> dict:
     user = load_json(CONFIG_FILE, {})
     cfg = {**DEFAULTS, **{k: v for k, v in user.items() if k != "review"}}
     cfg["review"] = {**DEFAULTS["review"], **(user.get("review") or {})}
+    cfg["review"]["memory_mcp"] = {**DEFAULTS["review"]["memory_mcp"], **(cfg["review"]["memory_mcp"] or {})}
     return cfg
 
 
@@ -307,10 +316,27 @@ def commit_paths(paths: list[Path], message: str) -> str | None:
     return git("rev-parse", "HEAD").strip()
 
 
-def hindsight_server() -> dict | None:
-    """The user-scope hindsight MCP server entry from ~/.claude.json, if any."""
+def memory_mcp_server(cfg: dict) -> dict | None:
+    """The user-scope entry of the configured memory MCP server (review.memory_mcp.server) in ~/.claude.json."""
     servers = load_json(HOME / ".claude.json", {}).get("mcpServers") or {}
-    return servers.get("hindsight")
+    return servers.get(cfg["memory_mcp"]["server"])
+
+
+def memory_mcp_tool(cfg: dict, tool: str) -> str:
+    """Full name of the memory MCP server's "recall" or "retain" tool: mcp__<server>__<tool>."""
+    mcp = cfg["memory_mcp"]
+    return f"mcp__{mcp['server']}__{mcp[tool + '_tool']}"
+
+
+def read_entries(path: Path) -> list[str]:
+    """Stripped, non-empty entries of a MEMORY.md/USER.md ([] when missing), Hermes _parse_entries.
+
+    Other read errors propagate: callers rewrite the file and must not replace an unreadable one."""
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return []
+    return [e for e in (x.strip() for x in raw.split(ENTRY_DELIMITER)) if e]
 
 
 def die_quietly_if_child() -> None:

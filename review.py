@@ -15,11 +15,13 @@ import time
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 import usage  # noqa: E402
-from childrun import (apply_stage, enforce_calls, manifest, permission_args, prepare_stage,  # noqa: E402
-                      run_claude, snapshot_protected, write_mcp_config, write_report)
+from childrun import (apply_memories, apply_stage, enforce_calls, manifest, permission_args,  # noqa: E402
+                      prepare_stage, run_claude, snapshot_protected, stage_memories, write_mcp_config,
+                      write_report)
 from common import (LOCKS, LOGS, PROMPTS, RUN_DIR, SESSIONS, SKILLS, commit_all, commit_paths,  # noqa: E402
-                    config, ensure_git, hindsight_server, iso, load_json, locked, log, log_exc,
-                    main_model, notice, now, read_frontmatter, repo_lock, save_json, skill_entries)
+                    config, ensure_git, iso, load_json, locked, log, log_exc, main_model,
+                    memory_mcp_server, memory_mcp_tool, notice, now, read_frontmatter, repo_lock,
+                    save_json, skill_entries)
 from transcript import build_digest, scan  # noqa: E402
 
 SCHEMA = {
@@ -51,6 +53,43 @@ def scope_text(stage) -> str:
             f"built-in skills")
 
 
+def memory_vars(cfg: dict, stage) -> dict[str, str]:
+    """Backend-specific wording for the {{USER_STORE}}, {{ENV_STORE}}, {{MEMORY_*}} prompt placeholders."""
+    if cfg["memory_backend"] == "builtin":
+        mem = stage / "memories"
+        return {
+            "USER_STORE": f"USER.md (`{mem}/USER.md`, limit {int(cfg['user_char_limit']):,} chars)",
+            "ENV_STORE": f"MEMORY.md (`{mem}/MEMORY.md`, limit {int(cfg['memory_char_limit']):,} chars)",
+            "MEMORY_RULES": "Each file is a list of entries separated by a line holding only `§`. Read both files "
+                            "first and skip any fact an existing entry already covers. APPEND ONLY: add each new fact "
+                            "as a new entry at the end of its file (`\\n§\\n` then the entry; an empty file gets the "
+                            "entry alone, via Write after the Read). Never change, reorder or remove an existing entry, "
+                            "and keep the whole file within its limit: anything else rejects that file's update. One "
+                            "concept per entry, short and self-contained.",
+            "MEMORY_SAVE": "as a new entry appended to that file",
+            "MEMORY_TOOL": f"the files `{mem}/MEMORY.md` (target `memory`) and `{mem}/USER.md` (target `user`), only "
+                           "when the review prompt asks for memory: Read them, then append entries with Edit/Write. "
+                           "Only `add` exists here; there is no patch or remove of an existing entry.",
+            "MEMORY_DRY_RUN": "DO NOT add memory entries. Reading MEMORY.md and USER.md is fine.",
+        }
+    recall, retain = memory_mcp_tool(cfg, "recall"), memory_mcp_tool(cfg, "retain")
+    return {
+        "USER_STORE": "tag `user` (Hermes USER.md)",
+        "ENV_STORE": "tag `environment` (Hermes MEMORY.md)",
+        "MEMORY_RULES": f"Pass the store's tag as the retain `tags`. Before each retain, run {recall} with a short query for that fact; if it is already "
+                        "stored, skip it. One concept per retain call, `context` = \"curator background review\".",
+        "MEMORY_SAVE": f"with the matching tag, using {retain}",
+        "MEMORY_TOOL": f"{cfg['memory_mcp']['server']}: `{recall}` and `{retain}` (only when they are in your tool list).",
+        "MEMORY_DRY_RUN": f"DO NOT call {retain}. {recall} is fine.",
+    }
+
+
+def render(text: str, values: dict[str, str]) -> str:
+    for key, value in values.items():
+        text = text.replace("{{" + key + "}}", value)
+    return text
+
+
 def ensure_agent_frontmatter(skill_md) -> bool:
     """Add metadata.created_by/created_at to a new skill's frontmatter if the reviewer left it out."""
     fm = read_frontmatter(skill_md)
@@ -74,14 +113,18 @@ def _run_child(rid: str, digest: str, prompt: str, dry_run: bool, memory_on: boo
         ensure_git()
         commit_all("curator: pre-review snapshot of manual edits")
     stage, before = prepare_stage(rid, writable)
+    cfg = config()["review"]
+    builtin = cfg["memory_backend"] == "builtin"
+    mem_before = stage_memories(stage) if memory_on and builtin else None
     system = (PROMPTS / "review-system.md").read_text(encoding="utf-8")
     system = system.replace("{{SCOPE}}", scope_text(stage)).replace("{{STAGE}}", str(stage / "skills")).replace("{{NOW}}", iso())
+    values = memory_vars(cfg, stage)
+    system, prompt = render(system, values), render(prompt, values)
     system_file = RUN_DIR / f"system-{rid}.md"
     RUN_DIR.mkdir(parents=True, exist_ok=True)
     system_file.write_text(system, encoding="utf-8")
     snapshot = None if dry_run else snapshot_protected(RUN_DIR / f"protected-{rid}.tar")
-    mcp = write_mcp_config() if memory_on else None
-    cfg = config()["review"]
+    mcp = write_mcp_config() if memory_on and not builtin else None
     try:
         meta = run_claude(user_message=f"{digest}\n\n{prompt}", system_file=system_file, schema=SCHEMA,
                           model=cfg["model"] or main_model(), budget=float(cfg["max_budget_usd"]),
@@ -98,6 +141,9 @@ def _run_child(rid: str, digest: str, prompt: str, dry_run: bool, memory_on: boo
                         report.setdefault("notes", []).append(f"added created_by metadata to {name}")
                 except (OSError, UnicodeError) as e:
                     report.setdefault("notes", []).append(f"could not add metadata to {name}: {e}")
+            if mem_before is not None:
+                report["memory_added"], mem_alerts = apply_memories(stage, mem_before, cfg)
+                alerts += mem_alerts
             applied, conflicts = apply_stage(stage, before, set(writable), existing, LOGS / "reviews" / f"{rid}.conflicts")
             alerts += conflicts
     finally:
@@ -153,8 +199,9 @@ def review(transcript: str, session_id: str, cwd: str, start: int, end: int | No
         write_report(report_path, report)
         return report
 
-    if scope in ("memory", "combined") and not (cfg["memory"] and hindsight_server()):
-        report["memory_skipped"] = "hindsight MCP server not configured" if cfg["memory"] else "review.memory=false"
+    if scope in ("memory", "combined") and not (cfg["memory"] and (cfg["memory_backend"] == "builtin" or memory_mcp_server(cfg))):
+        report["memory_skipped"] = (f"{cfg['memory_mcp']['server']} MCP server not configured" if cfg["memory"]
+                                    else "review.memory=false")
         scope = "skills"
         report["scope"] = scope
     memory_on = scope in ("memory", "combined")
@@ -172,12 +219,16 @@ def review(transcript: str, session_id: str, cwd: str, start: int, end: int | No
         with repo_lock():  # one writer of ~/.claude/skills at a time (review, curator run, rollback)
             meta, alerts, applied = _run_child(rid, digest, prompt, dry_run, memory_on, report)
     summary = report["summary"]
-    memory_writes = [c for c in meta["tool_calls"] if c["name"] == "mcp__hindsight__retain" and "error" not in c]
-    report["memory_writes"] = len(memory_writes)
+    if cfg["memory_backend"] == "builtin":
+        memory_writes = sum(report.get("memory_added", {}).values())
+    else:
+        retain = memory_mcp_tool(cfg, "retain")
+        memory_writes = sum(1 for c in meta["tool_calls"] if c["name"] == retain and "error" not in c)
+    report["memory_writes"] = memory_writes
     if not dry_run:
         parts = [f"{'created' if n in report['created'] else 'patched'} {n}" for n in applied]
         if memory_writes:
-            parts.append(f"saved {len(memory_writes)} memor{'y' if len(memory_writes) == 1 else 'ies'} to Hindsight")
+            parts.append(f"saved {memory_writes} memor{'y' if memory_writes == 1 else 'ies'}")
         if parts or alerts:
             notice("review", f"background review: {', '.join(parts) or 'no changes'}"
                    + (f" ({sum(a.startswith(('ALERT', 'CONFLICT')) for a in alerts)} alerts/conflicts, see `curator log`)"

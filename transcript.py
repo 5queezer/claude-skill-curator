@@ -11,7 +11,6 @@ from common import skill_name_from_path
 
 SKILL_LOAD_PREFIX = "Base directory for this skill:"
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
-MEMORY_WRITE_TOOLS = {"mcp__hindsight__retain"}
 
 
 def _text_blocks(content) -> list[str]:
